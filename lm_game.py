@@ -10,6 +10,7 @@ from argparse import Namespace
 from typing import Dict
 import shutil
 import sys
+import random
 
 # Suppress Gemini/PaLM gRPC warnings
 os.environ["GRPC_PYTHON_LOG_LEVEL"] = "40"  # ERROR level only
@@ -126,8 +127,8 @@ def parse_arguments():
     parser.add_argument(
         "--seed_base",
         type=int,
-        default=42,
-        help="RNG seed placeholder for compatibility with experiment_runner. Currently unused."
+        default=2026,
+        help="RNG seed for deterministic random injection. Set to the same value across runs for reproducible experiments."
     )
     parser.add_argument(
         "--max_tokens_per_model",
@@ -185,6 +186,16 @@ def parse_arguments():
             "Falls back to generic prompts if country-specific not found."
         ),
     )
+    parser.add_argument(
+        "--pause_after_year",
+        type=int,
+        default=None,
+        help=(
+            "Stop simulation after completing this year (e.g., --pause_after_year 1901). "
+            "The game will pause at the start of Spring of the following year, "
+            "allowing you to inject new prompts and resume with --run_dir."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -192,6 +203,13 @@ def parse_arguments():
 async def main():
     args = parse_arguments()
     start_whole = time.time()
+
+    # Set random seed for deterministic random injection sequences
+    # This makes generate_random_seed() produce the same sequence across runs
+    # We DON'T offset by year here - that's handled by the experiment runner if needed
+    # The seed should be set once per multi-year run, not per process
+    random.seed(args.seed_base)
+    logger.info(f"Random seed set to {args.seed_base} for reproducible experiments")
 
     logger.info(f"args.simple_prompts = {args.simple_prompts} (type: {type(args.simple_prompts)}), args.prompts_dir = {args.prompts_dir}")
     logger.info(f"config.SIMPLE_PROMPTS before update = {config.SIMPLE_PROMPTS}")
@@ -346,6 +364,12 @@ async def main():
         if run_config.end_at_phase and current_phase == run_config.end_at_phase:
             logger.info(f"Reached end phase {run_config.end_at_phase}, stopping simulation.")
             break
+        # Check for year-boundary pause (pause at start of Spring after completed year)
+        if run_config.pause_after_year is not None:
+            if current_phase.startswith("S") and year_int > run_config.pause_after_year:
+                logger.info(f"Pausing at {current_phase} (requested pause after year {run_config.pause_after_year}).")
+                logger.info(f"Resume with: python lm_game.py --run_dir {run_dir} --max_year {run_config.max_year}")
+                break
 
         logger.info(f"PHASE: {current_phase} (time so far: {time.time() - start_whole:.2f}s)")
         game_history.add_phase(current_phase)
