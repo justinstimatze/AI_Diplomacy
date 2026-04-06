@@ -250,8 +250,16 @@ for YEAR_INT in $(seq "$START_YEAR" "$MAX_YEAR"); do
     )
 
     # Determine how to pause
+    # end_at_phase stops BEFORE that phase, so we target the NEXT phase:
+    #   spring analysis → stop at fall (F{year}M)
+    #   fall analysis   → stop at next spring (S{year+1}M)
     if [[ "$PER_SEASON" == "true" ]]; then
-      GAME_ARGS+=(--end_at_phase "$PHASE")
+      if [[ "$SEASON" == "spring" ]]; then
+        GAME_ARGS+=(--end_at_phase "F${YEAR_INT}M")
+      else
+        NEXT_YEAR=$((YEAR_INT + 1))
+        GAME_ARGS+=(--end_at_phase "S${NEXT_YEAR}M")
+      fi
     else
       GAME_ARGS+=(--pause_after_year "$YEAR_INT")
     fi
