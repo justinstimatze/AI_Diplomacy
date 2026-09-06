@@ -70,7 +70,7 @@ def assign_models_to_powers() -> Dict[str, str]:
     """
 
     # POWER MODELS
-    
+
     return {
         "AUSTRIA": "o4-mini",
         "ENGLAND": "o3",
@@ -80,7 +80,7 @@ def assign_models_to_powers() -> Dict[str, str]:
         "RUSSIA": "gpt-5-reasoning-alpha-2025-07-19",
         "TURKEY": "o4-mini",
     }
-    
+
     # TEST MODELS
     """
     return {
@@ -342,7 +342,6 @@ def load_prompt(fname: str | Path, prompts_dir: str | Path | None = None) -> str
         raise Exception("Prompt file not found: " + str(prompt_path))
 
 
-
 # == New LLM Response Logging Function ==
 def log_llm_response(
     log_file_path: str,
@@ -392,6 +391,7 @@ def log_llm_response(
     except Exception as e:
         logger.error(f"Failed to log LLM response to {log_file_path}: {e}", exc_info=True)
 
+
 # A tuple of exception types that we consider safe to retry.
 # This includes network issues, timeouts, rate limits, and the ValueError
 # we now raise for empty/invalid responses.
@@ -405,6 +405,7 @@ RETRYABLE_EXCEPTIONS = (
     ValueError,  # We explicitly raise this for empty responses, which might be a temporary glitch.
 )
 
+
 async def run_llm_and_log(
     client: "BaseModelClient",
     prompt: str,
@@ -417,6 +418,7 @@ async def run_llm_and_log(
     backoff_base: float = 1.0,
     backoff_factor: float = 2.0,
     jitter: float = 0.3,
+    enable_tools: bool = False,
 ) -> str:
     """
     Calls `client.generate_response` with robust retry logic and returns the raw output.
@@ -432,7 +434,7 @@ async def run_llm_and_log(
 
     for attempt in range(attempts):
         try:
-            raw_response = await client.generate_response(prompt, temperature=temperature)
+            raw_response = await client.generate_response(prompt, temperature=temperature, enable_tools=enable_tools)
 
             # The clients now raise ValueError, but this is a final safeguard.
             if not raw_response or not raw_response.strip():
@@ -548,6 +550,7 @@ def normalize_recipient_name(recipient: str) -> str:
 
     return normalized
 
+
 def parse_prompts_dir_arg(raw: str | None) -> Dict[str, Path]:
     """
     Resolve --prompts_dir into a mapping {power: Path}.
@@ -561,10 +564,7 @@ def parse_prompts_dir_arg(raw: str | None) -> Dict[str, Path]:
 
     parts = [s.strip() for s in raw.split(",") if s.strip()]
     if len(parts) not in {1, 7}:
-        raise ValueError(
-            f"--prompts_dir expects 1 or 7 paths, got {len(parts)} "
-            f"({raw})"
-        )
+        raise ValueError(f"--prompts_dir expects 1 or 7 paths, got {len(parts)} ({raw})")
 
     # Expand/resolve & verify
     def _norm(p: str) -> Path:
@@ -580,6 +580,7 @@ def parse_prompts_dir_arg(raw: str | None) -> Dict[str, Path]:
     paths = [_norm(p) for p in parts]
     return dict(zip(POWERS_ORDER, paths))
 
+
 async def atomic_write_json_async(data: dict, filepath: str):
     """Writes a dictionary to a JSON file atomically using async I/O."""
     # Use asyncio.to_thread to run the synchronous atomic_write_json in a thread pool
@@ -590,34 +591,22 @@ async def atomic_write_json_async(data: dict, filepath: str):
 async def log_llm_response_async(
     log_file_path: str,
     model_name: str,
-    power_name: Optional[str],  
+    power_name: Optional[str],
     phase: str,
     response_type: str,
-    raw_input_prompt: str,  
+    raw_input_prompt: str,
     raw_response: str,
-    success: str,  
+    success: str,
 ):
     """Async version of log_llm_response that runs in a thread pool."""
-    await asyncio.to_thread(
-        log_llm_response,
-        log_file_path,
-        model_name,
-        power_name,
-        phase,
-        response_type,
-        raw_input_prompt,
-        raw_response,
-        success
-    )
-
-
+    await asyncio.to_thread(log_llm_response, log_file_path, model_name, power_name, phase, response_type, raw_input_prompt, raw_response, success)
 
 
 def get_board_state(board_state: dict, game: Game) -> Tuple[str, str]:
     # Build units representation with power status and counts
     units_lines = []
     for p, units in board_state["units"].items():
-        units_str   = ", ".join(units)
+        units_str = ", ".join(units)
         units_count = len(units)
         line = f"  {p}: {units_count} unit{'s' if units_count != 1 else ''} – {units_str}"
         if game.powers[p].is_eliminated():
@@ -628,7 +617,7 @@ def get_board_state(board_state: dict, game: Game) -> Tuple[str, str]:
     # Build centers representation with power status and counts
     centers_lines = []
     for p, centers in board_state["centers"].items():
-        centers_str   = ", ".join(centers)
+        centers_str = ", ".join(centers)
         centers_count = len(centers)
         line = f"  {p}: {centers_count} supply center{'s' if centers_count != 1 else ''} – {centers_str}"
         if game.powers[p].is_eliminated():

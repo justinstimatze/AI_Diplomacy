@@ -11,6 +11,18 @@
 #   ./run_gemot_experiment.sh --name gemot_v13 --max-year 1910
 #   ./run_gemot_experiment.sh --name control_v13 --max-year 1910 --no-gemot
 #   ./run_gemot_experiment.sh --name gemot_v13_seasonal --max-year 1910 --per-season
+#   ./run_gemot_experiment.sh --name gemot_v15a --seed 2027 --per-season              # new seed, incremental
+#   ./run_gemot_experiment.sh --name gemot_v15b --seed 2027 --per-season --no-incremental  # new seed, full extraction
+#   ./run_gemot_experiment.sh --name lexicon_treatment_a --no-gemot --lexicon --per-season  # live lexicon tool access
+#
+# --lexicon gives Claude-powered powers live tool-calling access to lexicon
+# (github.com/justinstimatze/lexicon, a library of named strategic/social reasoning
+# patterns) during negotiation and planning -- implies --planning_phase, since
+# there'd be nothing to attach tool access to otherwise. Orthogonal to --no-gemot;
+# unset by default, so a plain run's behavior is unchanged from before this flag
+# existed. Requires a `lexicon` binary reachable via $LEXICON_BIN (default: `lexicon`
+# on PATH) and $LEXICON_DIR pointed at a lexicon checkout with an elements corpus and
+# ANTHROPIC_API_KEY configured (see that repo's render/.env.example).
 #
 # Prerequisites:
 #   - gemot server running: cd ~/Documents/gemot && ./gemot http --addr :8080
@@ -38,7 +50,10 @@ MAX_YEAR=1910
 START_YEAR=1901
 NUM_NEGOTIATION_ROUNDS=2
 GEMOT_ENABLED=true
+LEXICON_ENABLED=false
 PER_SEASON=false
+INCREMENTAL=true
+SEED_BASE=2026
 GEMOT_DIR="$HOME/Documents/gemot"
 AI_DIPLOMACY_DIR="$HOME/Documents/AI_Diplomacy"
 GEMOT_URL="http://localhost:8080/mcp"
@@ -54,10 +69,13 @@ while [[ $# -gt 0 ]]; do
     --start-year) START_YEAR="$2"; shift 2 ;;
     --rounds) NUM_NEGOTIATION_ROUNDS="$2"; shift 2 ;;
     --no-gemot) GEMOT_ENABLED=false; shift ;;
+    --lexicon) LEXICON_ENABLED=true; shift ;;
     --per-season) PER_SEASON=true; shift ;;
     --gemot-url) GEMOT_URL="$2"; shift 2 ;;
     --results-dir) RESULTS_DIR="$2"; shift 2 ;;
     --prompts) PROMPTS_TEMPLATE_DIR="$2"; shift 2 ;;
+    --seed) SEED_BASE="$2"; shift 2 ;;
+    --no-incremental) INCREMENTAL=false; shift ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
 done
@@ -77,7 +95,11 @@ mkdir -p "$RESULTS_DIR"
 echo "Experiment: $EXPERIMENT_NAME"
 echo "Model: $MODEL"
 echo "Max year: $MAX_YEAR"
+echo "Seed: $SEED_BASE"
+echo "Per-season: $PER_SEASON"
+echo "Incremental: $INCREMENTAL"
 echo "Gemot: $GEMOT_ENABLED"
+echo "Lexicon: $LEXICON_ENABLED"
 echo "Results: $RESULTS_DIR"
 echo "---"
 
@@ -89,6 +111,9 @@ if [[ -f "$GEMOT_DIR/.env" ]]; then
   export $(grep -v '^#' "$GEMOT_DIR/.env" | xargs)
 fi
 export GEMOT_LIVE_URL="$GEMOT_URL"
+if [[ "$LEXICON_ENABLED" == "true" ]]; then
+  export AI_DIP_LEXICON_ENABLED=1
+fi
 
 # Activate AI_Diplomacy venv
 if [[ -f "$AI_DIPLOMACY_DIR/.venv/bin/activate" ]]; then
@@ -134,9 +159,13 @@ run_analysis_cycle() {
     --game "$RUN_DIR/lmvsgame.json"
     --year "$YEAR_NUM"
     --output "$CYCLE_OUTPUT"
-    --state "$STATE_FILE"
     --experiment "$EXPERIMENT_NAME"
   )
+
+  # Incremental analysis reuses deliberation IDs across cycles (prior claims skip re-extraction)
+  if [[ "$INCREMENTAL" == "true" ]]; then
+    ANALYSIS_ARGS+=(--state "$STATE_FILE")
+  fi
 
   # Per-season: only collect messages from the target phase
   if [[ -n "$PHASE_NAME" && "$PHASE_NAME" != Y* ]]; then
@@ -247,7 +276,15 @@ for YEAR_INT in $(seq "$START_YEAR" "$MAX_YEAR"); do
       --max_year "$MAX_YEAR"
       --num_negotiation_rounds "$NUM_NEGOTIATION_ROUNDS"
       --simple_prompts false
+      --seed_base "$SEED_BASE"
     )
+
+    # Lexicon tool access implies the planning phase (there'd be nothing to attach
+    # tool access to otherwise) -- both gated behind --lexicon so a plain --no-gemot
+    # or default run's behavior is unchanged from before this flag existed.
+    if [[ "$LEXICON_ENABLED" == "true" ]]; then
+      GAME_ARGS+=(--lexicon --planning_phase)
+    fi
 
     # Determine how to pause
     # end_at_phase stops BEFORE that phase, so we target the NEXT phase:

@@ -5,7 +5,7 @@ import logging
 import ast  # For literal_eval in JSON fallback parsing
 import aiohttp  # For direct HTTP requests to Responses API
 
-from typing import List, Dict, Optional, Tuple, NamedTuple
+from typing import List, Dict, Optional, Tuple, NamedTuple, Any
 from dotenv import load_dotenv
 
 # Use Async versions of clients
@@ -62,10 +62,12 @@ class BaseModelClient:
         self.system_prompt = content
         logger.info(f"[{self.model_name}] System prompt updated.")
 
-    async def generate_response(self, prompt: str, temperature: float = 0.0, inject_random_seed: bool = True) -> str:
+    async def generate_response(self, prompt: str, temperature: float = 0.0, inject_random_seed: bool = True, enable_tools: bool = False) -> str:
         """
         Returns a raw string from the LLM.
-        Subclasses override this.
+        Subclasses override this. `enable_tools` is a hint from the caller that this
+        call may use tools (e.g. lexicon) if the concrete client supports it and has
+        one configured; clients that don't support tool use simply ignore it.
         """
         raise NotImplementedError("Subclasses must implement generate_response().")
 
@@ -447,7 +449,7 @@ class BaseModelClient:
             # Try to load country-specific version first
             country_specific_file = get_prompt_path(f"conversation_instructions_{power_name.lower()}.txt")
             instructions = load_prompt(country_specific_file, prompts_dir=self.prompts_dir)
-            
+
             # Fall back to generic if country-specific not found
             if not instructions:
                 instructions = load_prompt(get_prompt_path("conversation_instructions.txt"), prompts_dir=self.prompts_dir)
@@ -486,6 +488,10 @@ class BaseModelClient:
             unanswered_messages += "\nNo urgent messages requiring direct responses.\n"
 
         final_prompt = context + unanswered_messages + "\n\n" + instructions
+        if getattr(self, "lexicon_client", None) is not None:
+            from .lexicon_client import LEXICON_TOOL_PREAMBLE
+
+            final_prompt = f"{final_prompt}\n\n{LEXICON_TOOL_PREAMBLE}"
         final_prompt = (
             final_prompt.replace("AUSTRIA", "Austria")
             .replace("ENGLAND", "England")
@@ -576,6 +582,7 @@ class BaseModelClient:
                 power_name=power_name,
                 phase=game_phase,
                 response_type="negotiation",  # For run_llm_and_log's internal context
+                enable_tools=True,  # negotiation may consult lexicon when self.lexicon_client is set
             )
             logger.debug(f"[{self.model_name}] Raw LLM response for {power_name}:\n{raw_response}")
 
@@ -722,7 +729,7 @@ class BaseModelClient:
         # For simplicity, let's pass empty if not strictly needed by context for planning.
         possible_orders_for_context = {}  # game.get_all_possible_orders() if needed by context
 
-        context_prompt = self.build_context_prompt(
+        context_prompt = build_context_prompt(
             game,
             board_state,
             power_name,
@@ -735,6 +742,10 @@ class BaseModelClient:
         )
 
         full_prompt = f"{context_prompt}\n\n{planning_instructions}"
+        if getattr(self, "lexicon_client", None) is not None:
+            from .lexicon_client import LEXICON_TOOL_PREAMBLE
+
+            full_prompt = f"{full_prompt}\n\n{LEXICON_TOOL_PREAMBLE}"
         if self.system_prompt:
             full_prompt = f"{self.system_prompt}\n\n{full_prompt}"
 
@@ -750,6 +761,7 @@ class BaseModelClient:
                 power_name=power_name,
                 phase=game.current_short_phase,
                 response_type="plan_generation",  # More specific type for run_llm_and_log context
+                enable_tools=True,  # planning may consult lexicon when self.lexicon_client is set
             )
             logger.debug(f"[{self.model_name}] Raw LLM response for {power_name} plan generation:\n{raw_plan_response}")
             # No parsing needed for the plan, return the raw string
@@ -779,6 +791,7 @@ class BaseModelClient:
 # 2) Concrete Implementations
 ##############################################################################
 
+
 class OpenAIClient(BaseModelClient):
     """Async client for OpenAI-compatible chat-completion endpoints."""
 
@@ -804,6 +817,7 @@ class OpenAIClient(BaseModelClient):
         prompt: str,
         temperature: float = 0.0,
         inject_random_seed: bool = True,
+        enable_tools: bool = False,
     ) -> str:
         try:
             system_prompt_content = f"{generate_random_seed()}\n\n{self.system_prompt}" if inject_random_seed else self.system_prompt
@@ -817,14 +831,11 @@ class OpenAIClient(BaseModelClient):
                     {"role": "user", "content": prompt_with_cta},
                 ],
             }
-            
+
             # Handle model-specific parameters
             # Check if model name starts with 'nectarine' or is in the specific list
-            uses_max_completion_tokens = (
-                self.model_name in ["o4-mini", "o3-mini", "o3", "gpt-4.1"] or
-                self.model_name.startswith("nectarine")
-            )
-            
+            uses_max_completion_tokens = self.model_name in ["o4-mini", "o3-mini", "o3", "gpt-4.1"] or self.model_name.startswith("nectarine")
+
             if uses_max_completion_tokens:
                 completion_params["max_completion_tokens"] = self.max_tokens
                 # o4-mini, o3-mini, o3 only support default temperature of 1.0
@@ -835,15 +846,10 @@ class OpenAIClient(BaseModelClient):
             else:
                 completion_params["max_tokens"] = self.max_tokens
                 completion_params["temperature"] = temperature
-            
+
             response = await self.client.chat.completions.create(**completion_params)
 
-            if (
-                not response
-                or not response.choices
-                or not response.choices[0].message
-                or not response.choices[0].message.content
-            ):
+            if not response or not response.choices or not response.choices[0].message or not response.choices[0].message.content:
                 raise ValueError(f"[{self.model_name}] LLM returned an empty or invalid response.")
 
             return response.choices[0].message.content.strip()
@@ -855,9 +861,10 @@ class OpenAIClient(BaseModelClient):
             extra = ""
             try:
                 from openai import OpenAIError  # runtime import avoids circulars
+
                 if isinstance(e, OpenAIError):
                     status = getattr(e, "status_code", None)
-                    resp  = getattr(e, "response", None)
+                    resp = getattr(e, "response", None)
                     if status:
                         extra += f" (status {status})"
                     if resp is not None:
@@ -865,9 +872,7 @@ class OpenAIClient(BaseModelClient):
                             body = resp.json() if hasattr(resp, "json") else resp
                         except Exception:
                             body = str(resp)
-                        body_str = (
-                            json.dumps(body) if isinstance(body, (dict, list)) else str(body)
-                        )
+                        body_str = json.dumps(body) if isinstance(body, (dict, list)) else str(body)
                         if len(body_str) > 3_000:
                             body_str = body_str[:3_000] + "…[truncated]"
                         extra += f" – body: {body_str}"
@@ -884,17 +889,74 @@ class ClaudeClient(BaseModelClient):
     For 'claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022', etc.
     """
 
-    def __init__(self, model_name: str, prompts_dir: Optional[str] = None):
+    def __init__(self, model_name: str, prompts_dir: Optional[str] = None, lexicon_client: Optional[Any] = None):
         super().__init__(model_name, prompts_dir=prompts_dir)
         self.client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+        # Optional ai_diplomacy.lexicon_client.LexiconClient. When set AND the
+        # caller passes enable_tools=True (negotiation/planning only, never
+        # order generation), generate_response runs a bounded tool-use loop
+        # instead of a single-shot completion. Untyped (Any) to avoid a
+        # module-level import cycle with lexicon_client.py.
+        self.lexicon_client = lexicon_client
 
-    async def generate_response(self, prompt: str, temperature: float = 0.0, inject_random_seed: bool = True) -> str:
+    async def _generate_response_with_tools(self, prompt: str, temperature: float, system_prompt_content: str) -> str:
+        from .lexicon_client import LEXICON_TOOLS, DEFAULT_MAX_TOOL_ROUNDTRIPS
+
+        tools = [{"name": t["name"], "description": t["description"], "input_schema": t["input_schema"]} for t in LEXICON_TOOLS]
+        messages = [{"role": "user", "content": prompt + "\n\nPROVIDE YOUR RESPONSE BELOW:"}]
+
+        for _ in range(DEFAULT_MAX_TOOL_ROUNDTRIPS):
+            response = await self.client.messages.create(
+                model=self.model_name,
+                max_tokens=self.max_tokens,
+                system=system_prompt_content,
+                messages=messages,
+                temperature=temperature,
+                tools=tools,
+            )
+            if response.stop_reason != "tool_use":
+                break
+
+            messages.append({"role": "assistant", "content": response.content})
+            tool_results = []
+            for block in response.content:
+                if getattr(block, "type", None) != "tool_use":
+                    continue
+                result = await self.lexicon_client.call_tool(block.name, block.input or {})
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": json.dumps(result) if result is not None else "no result available (lexicon call failed or timed out)",
+                    }
+                )
+            messages.append({"role": "user", "content": tool_results})
+        else:
+            # Hit the round-trip cap while the model still wanted to call tools --
+            # force a final answer with tools removed so it must respond in text.
+            response = await self.client.messages.create(
+                model=self.model_name,
+                max_tokens=self.max_tokens,
+                system=system_prompt_content,
+                messages=messages,
+                temperature=temperature,
+            )
+
+        text_blocks = [b.text for b in response.content if getattr(b, "type", None) == "text" and getattr(b, "text", None)]
+        if not text_blocks:
+            raise ValueError(f"[{self.model_name}] LLM returned no text content after tool loop.")
+        return "\n".join(text_blocks).strip()
+
+    async def generate_response(self, prompt: str, temperature: float = 0.0, inject_random_seed: bool = True, enable_tools: bool = False) -> str:
         # Updated Claude messages format
         try:
             system_prompt_content = self.system_prompt
             if inject_random_seed:
                 random_seed = generate_random_seed()
                 system_prompt_content = f"{random_seed}\n\n{self.system_prompt}"
+
+            if enable_tools and self.lexicon_client is not None:
+                return await self._generate_response_with_tools(prompt, temperature, system_prompt_content)
 
             response = await self.client.messages.create(
                 model=self.model_name,
@@ -913,6 +975,7 @@ class ClaudeClient(BaseModelClient):
             extra = ""
             try:
                 import anthropic
+
                 if isinstance(e, anthropic.errors.APIStatusError):
                     extra += f" (status {e.status_code})"
                     body = getattr(e, "response_json", None)
@@ -943,7 +1006,7 @@ class GeminiClient(BaseModelClient):
         self.client = genai.GenerativeModel(model_name)
         logger.debug(f"[{self.model_name}] Initialized Gemini client (genai.GenerativeModel)")
 
-    async def generate_response(self, prompt: str, temperature: float = 0.0, inject_random_seed: bool = True) -> str:
+    async def generate_response(self, prompt: str, temperature: float = 0.0, inject_random_seed: bool = True, enable_tools: bool = False) -> str:
         system_prompt_content = self.system_prompt
         if inject_random_seed:
             random_seed = generate_random_seed()
@@ -980,7 +1043,7 @@ class DeepSeekClient(BaseModelClient):
         self.api_key = os.environ.get("DEEPSEEK_API_KEY")
         self.client = AsyncDeepSeekOpenAI(api_key=self.api_key, base_url="https://api.deepseek.com/")
 
-    async def generate_response(self, prompt: str, temperature: float = 0.0, inject_random_seed: bool = True) -> str:
+    async def generate_response(self, prompt: str, temperature: float = 0.0, inject_random_seed: bool = True, enable_tools: bool = False) -> str:
         try:
             # Append the call to action to the user's prompt
             prompt_with_cta = prompt + "\n\nPROVIDE YOUR RESPONSE BELOW:"
@@ -1000,13 +1063,13 @@ class DeepSeekClient(BaseModelClient):
                 "stream": False,
                 "temperature": temperature,
             }
-            
+
             # Use max_completion_tokens for o4-mini, o3-mini models and nectarine models
             if self.model_name in ["o4-mini", "o3-mini"] or self.model_name.startswith("nectarine"):
                 completion_params["max_completion_tokens"] = self.max_tokens
             else:
                 completion_params["max_tokens"] = self.max_tokens
-            
+
             response = await self.client.chat.completions.create(**completion_params)
 
             logger.debug(f"[{self.model_name}] Raw DeepSeek response:\n{response}")
@@ -1021,6 +1084,7 @@ class DeepSeekClient(BaseModelClient):
             extra = ""
             try:
                 from openai import OpenAIError
+
                 if isinstance(e, OpenAIError):
                     status = getattr(e, "status_code", None)
                     if status:
@@ -1031,9 +1095,7 @@ class DeepSeekClient(BaseModelClient):
                             body = resp.json() if hasattr(resp, "json") else resp
                         except Exception:
                             body = str(resp)
-                        body_str = (
-                            json.dumps(body) if isinstance(body, (dict, list)) else str(body)
-                        )
+                        body_str = json.dumps(body) if isinstance(body, (dict, list)) else str(body)
                         if len(body_str) > 3_000:
                             body_str = body_str[:3_000] + "…[truncated]"
                         extra += f" – body: {body_str}"
@@ -1074,7 +1136,7 @@ class OpenAIResponsesClient(BaseModelClient):
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def generate_response(self, prompt: str, temperature: float = 0.0, inject_random_seed: bool = True) -> str:
+    async def generate_response(self, prompt: str, temperature: float = 0.0, inject_random_seed: bool = True, enable_tools: bool = False) -> str:
         try:
             # The Responses API uses a different format than chat completions
             # Combine system prompt and user prompt into a single input
@@ -1093,14 +1155,26 @@ class OpenAIResponsesClient(BaseModelClient):
 
             # The Responses API uses max_output_tokens for all models
             payload["max_output_tokens"] = self.max_tokens
-            
+
             # Only add temperature for models that support it
-            models_without_temp = ['o3', 'o4-mini', 'gpt-5-reasoning-alpha-2025-07-19', 'nectarine-alpha-2025-07-25', 'nectarine-alpha-new-reasoning-effort-2025-07-25']
+            models_without_temp = [
+                "o3",
+                "o4-mini",
+                "gpt-5-reasoning-alpha-2025-07-19",
+                "nectarine-alpha-2025-07-25",
+                "nectarine-alpha-new-reasoning-effort-2025-07-25",
+            ]
             if self.model_name not in models_without_temp:
                 payload["temperature"] = temperature
 
             # Add reasoning effort for models that support it
-            reasoning_models = ['gpt-5-reasoning-alpha-2025-07-19', 'o4-mini', 'nectarine-alpha-2025-07-25', 'o4-mini-alpha-2025-07-11', 'nectarine-alpha-new-reasoning-effort-2025-07-25']
+            reasoning_models = [
+                "gpt-5-reasoning-alpha-2025-07-19",
+                "o4-mini",
+                "nectarine-alpha-2025-07-25",
+                "o4-mini-alpha-2025-07-11",
+                "nectarine-alpha-new-reasoning-effort-2025-07-25",
+            ]
             if self.reasoning_effort and self.model_name in reasoning_models:
                 payload["reasoning"] = {"effort": self.reasoning_effort}
 
@@ -1172,7 +1246,7 @@ class OpenRouterClient(BaseModelClient):
 
         logger.debug(f"[{self.model_name}] Initialized OpenRouter client")
 
-    async def generate_response(self, prompt: str, temperature: float = 0.0, inject_random_seed: bool = True) -> str:
+    async def generate_response(self, prompt: str, temperature: float = 0.0, inject_random_seed: bool = True, enable_tools: bool = False) -> str:
         """Generate a response using OpenRouter with robust error handling."""
         try:
             # Append the call to action to the user's prompt
@@ -1201,6 +1275,7 @@ class OpenRouterClient(BaseModelClient):
             extra = ""
             try:
                 from openai import OpenAIError
+
                 if isinstance(e, OpenAIError):
                     status = getattr(e, "status_code", None)
                     if status:
@@ -1211,9 +1286,7 @@ class OpenRouterClient(BaseModelClient):
                             body = resp.json() if hasattr(resp, "json") else resp
                         except Exception:
                             body = str(resp)
-                        body_str = (
-                            json.dumps(body) if isinstance(body, (dict, list)) else str(body)
-                        )
+                        body_str = json.dumps(body) if isinstance(body, (dict, list)) else str(body)
                         if len(body_str) > 3_000:
                             body_str = body_str[:3_000] + "…[truncated]"
                         extra += f" – body: {body_str}"
@@ -1244,7 +1317,7 @@ class TogetherAIClient(BaseModelClient):
         self.client = AsyncTogether(api_key=self.api_key)
         logger.info(f"[{self.model_name}] Initialized TogetherAI client for model: {self.model_name}")
 
-    async def generate_response(self, prompt: str) -> str:
+    async def generate_response(self, prompt: str, temperature: float = 0.0, inject_random_seed: bool = True, enable_tools: bool = False) -> str:
         """
         Generates a response from the Together AI model.
         """
@@ -1330,13 +1403,13 @@ class RequestsOpenAIClient(BaseModelClient):
 
         return r.json()
 
-
     # ---------------- public async API ---------------- #
     async def generate_response(
         self,
         prompt: str,
         temperature: float = 0.0,
         inject_random_seed: bool = True,
+        enable_tools: bool = False,
     ) -> str:
         system_prompt_content = f"{generate_random_seed()}\n\n{self.system_prompt}" if inject_random_seed else self.system_prompt
 
@@ -1351,20 +1424,20 @@ class RequestsOpenAIClient(BaseModelClient):
             ],
             "temperature": temperature,
         }
-        
+
         # Use max_completion_tokens for o4-mini, o3-mini, o3, gpt-4.1 models and nectarine models
         if self.model_name in ["o4-mini", "o3-mini", "o3", "gpt-4.1"] or self.model_name.startswith("nectarine"):
             payload["max_completion_tokens"] = self.max_tokens
         else:
             payload["max_tokens"] = self.max_tokens
 
-        #if self.model_name == "qwen/qwen3-235b-a22b" and self.base_url == "https://openrouter.ai/api/v1":
+        # if self.model_name == "qwen/qwen3-235b-a22b" and self.base_url == "https://openrouter.ai/api/v1":
         #    payload["provider"] = {
         #        "order": ["Cerebras"],     # fast qwen-2-35B
         #        "allow_fallbacks": False,
         #    }
 
-        if (self.model_name == 'o3' or self.model_name == 'o4-mini'):
+        if self.model_name == "o3" or self.model_name == "o4-mini":
             del payload["temperature"]
             if "max_tokens" in payload:
                 del payload["max_tokens"]
@@ -1376,8 +1449,8 @@ class RequestsOpenAIClient(BaseModelClient):
             if not data.get("choices") or not data["choices"][0].get("message") or not data["choices"][0]["message"].get("content"):
                 raise ValueError(f"[{self.model_name}] LLM returned an empty or invalid response.")
             content = data["choices"][0]["message"]["content"].strip()
-            if '<think>' in content and '</think>' in content:
-                content = content[content.rfind('</think>') + len('</think>'):]
+            if "<think>" in content and "</think>" in content:
+                content = content[content.rfind("</think>") + len("</think>") :]
             return content
         except (KeyError, IndexError, TypeError) as e:
             logger.error(f"[{self.model_name}] Bad response format: {e}", exc_info=True)
@@ -1419,17 +1492,19 @@ def _parse_model_spec(raw: str) -> ModelSpec:
 
     return ModelSpec(prefix, model, base_part or None, key_part or None)
 
-class Prefix(StrEnum):
-    OPENAI            = "openai"
-    OPENAI_REQUESTS   = "openai-requests"
-    OPENAI_RESPONSES  = "openai-responses"
-    ANTHROPIC         = "anthropic"
-    GEMINI            = "gemini"
-    DEEPSEEK          = "deepseek"
-    OPENROUTER        = "openrouter"
-    TOGETHER          = "together"
 
-def load_model_client(model_id: str, prompts_dir: Optional[str] = None) -> BaseModelClient:
+class Prefix(StrEnum):
+    OPENAI = "openai"
+    OPENAI_REQUESTS = "openai-requests"
+    OPENAI_RESPONSES = "openai-responses"
+    ANTHROPIC = "anthropic"
+    GEMINI = "gemini"
+    DEEPSEEK = "deepseek"
+    OPENROUTER = "openrouter"
+    TOGETHER = "together"
+
+
+def load_model_client(model_id: str, prompts_dir: Optional[str] = None, lexicon_client: Optional[Any] = None) -> BaseModelClient:
     """
     Recognises strings like
         gpt-4o
@@ -1446,22 +1521,29 @@ def load_model_client(model_id: str, prompts_dir: Optional[str] = None) -> BaseM
     # Extract reasoning effort if present (before general parsing)
     reasoning_effort = None
     actual_model_id = model_id
-    
+
     # Check if this is a reasoning model with effort specified
-    reasoning_models = ['gpt-5-reasoning-alpha-2025-07-19', 'o4-mini', 'nectarine-alpha-2025-07-25', 'nectarine-alpha-new-reasoning-effort-2025-07-25']
+    reasoning_models = [
+        "gpt-5-reasoning-alpha-2025-07-19",
+        "o4-mini",
+        "nectarine-alpha-2025-07-25",
+        "nectarine-alpha-new-reasoning-effort-2025-07-25",
+    ]
     for model in reasoning_models:
-        if model_id.startswith(model + ':'):
-            parts = model_id.split(':', 1)
+        if model_id.startswith(model + ":"):
+            parts = model_id.split(":", 1)
             effort_part = parts[1]
             # Check if the effort part is valid before treating it as effort
             # (it could be a prefix like "openai:")
-            if effort_part.lower() in ['minimal', 'medium', 'high']:
+            if effort_part.lower() in ["minimal", "medium", "high"]:
                 actual_model_id = parts[0]
                 reasoning_effort = effort_part.lower()
                 break
-    
+
     spec = _parse_model_spec(actual_model_id)
-    logger.info(f"[load_model_client] Loading client for model_id='{model_id}', parsed spec: prefix={spec.prefix}, model={spec.model}, reasoning_effort={reasoning_effort}")
+    logger.info(
+        f"[load_model_client] Loading client for model_id='{model_id}', parsed spec: prefix={spec.prefix}, model={spec.model}, reasoning_effort={reasoning_effort}"
+    )
 
     # Inline key overrides env; otherwise fall back as usual *per client*
     inline_key = spec.key
@@ -1497,7 +1579,7 @@ def load_model_client(model_id: str, prompts_dir: Optional[str] = None) -> BaseM
             case Prefix.OPENAI_RESPONSES:
                 return OpenAIResponsesClient(spec.model, prompts_dir, api_key=inline_key, reasoning_effort=reasoning_effort)
             case Prefix.ANTHROPIC:
-                return ClaudeClient(spec.model, prompts_dir)
+                return ClaudeClient(spec.model, prompts_dir, lexicon_client=lexicon_client)
             case Prefix.GEMINI:
                 return GeminiClient(spec.model, prompts_dir)
             case Prefix.DEEPSEEK:
@@ -1514,7 +1596,12 @@ def load_model_client(model_id: str, prompts_dir: Optional[str] = None) -> BaseM
     logger.info(f"[load_model_client] Heuristic path: checking model='{spec.model}', lower_id='{lower_id}'")
 
     # Check if this is a reasoning model that should use Responses API
-    reasoning_models_requiring_responses = ['gpt-5-reasoning-alpha-2025-07-19', 'o4-mini', 'nectarine-alpha-2025-07-25', 'nectarine-alpha-new-reasoning-effort-2025-07-25']
+    reasoning_models_requiring_responses = [
+        "gpt-5-reasoning-alpha-2025-07-19",
+        "o4-mini",
+        "nectarine-alpha-2025-07-25",
+        "nectarine-alpha-new-reasoning-effort-2025-07-25",
+    ]
     if spec.model in reasoning_models_requiring_responses:
         logger.info(f"[load_model_client] Selected OpenAIResponsesClient for reasoning model '{spec.model}'")
         return OpenAIResponsesClient(spec.model, prompts_dir, api_key=inline_key, reasoning_effort=reasoning_effort)
@@ -1534,7 +1621,7 @@ def load_model_client(model_id: str, prompts_dir: Optional[str] = None) -> BaseM
 
     if "claude" in lower_id:
         logger.info(f"[load_model_client] Selected ClaudeClient for '{spec.model}'")
-        return ClaudeClient(spec.model, prompts_dir)
+        return ClaudeClient(spec.model, prompts_dir, lexicon_client=lexicon_client)
 
     if "gemini" in lower_id:
         logger.info(f"[load_model_client] Selected GeminiClient for '{spec.model}'")

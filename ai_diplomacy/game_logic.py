@@ -35,20 +35,27 @@ def serialize_agent(agent: DiplomacyAgent) -> dict:
     }
 
 
-def deserialize_agent(agent_data: dict, prompts_dir: Optional[str] = None, *, override_model_id: Optional[str] = None, override_max_tokens: Optional[int] = None) -> DiplomacyAgent:
+def deserialize_agent(
+    agent_data: dict,
+    prompts_dir: Optional[str] = None,
+    *,
+    override_model_id: Optional[str] = None,
+    override_max_tokens: Optional[int] = None,
+    lexicon_client: Optional[Any] = None,
+) -> DiplomacyAgent:
     """
     Recreates an agent object from a dictionary.
 
     If *override_model_id* is provided (e.g. because the CLI argument
     ``--models`` was used when resuming a game), that model is loaded
     instead of the one stored in the save file.
-    
+
     If *override_max_tokens* is provided (e.g. because the CLI argument
     ``--max_tokens`` was used when resuming a game), that value is used
     instead of the one stored in the save file.
     """
     model_id = override_model_id or agent_data["model_id"]
-    client = load_model_client(model_id, prompts_dir=prompts_dir)
+    client = load_model_client(model_id, prompts_dir=prompts_dir, lexicon_client=lexicon_client)
 
     # Use override if provided, otherwise use saved value, otherwise default to 16000
     client.max_tokens = override_max_tokens or agent_data.get("max_tokens", 16000)
@@ -72,6 +79,7 @@ def deserialize_agent(agent_data: dict, prompts_dir: Optional[str] = None, *, ov
 
 _PHASE_RE = re.compile(r"^[SW](\d{4})[MRA]$")
 
+
 def _phase_year(phase_name: str) -> Optional[int]:
     """
     Return the four-digit year encoded in standard phase strings
@@ -80,7 +88,6 @@ def _phase_year(phase_name: str) -> Optional[int]:
     """
     m = _PHASE_RE.match(phase_name)
     return int(m.group(1)) if m else None
-
 
 
 async def save_game_state(
@@ -126,11 +133,7 @@ async def save_game_state(
     saved_game = to_saved_game_format(game)
 
     # 3.  Re-insert extras, order_results, phase_summaries, state_agents --------
-    current_state_agents = {
-        p_name: serialize_agent(p_agent)
-        for p_name, p_agent in agents.items()
-        if not game.powers[p_name].is_eliminated()
-    }
+    current_state_agents = {p_name: serialize_agent(p_agent) for p_name, p_agent in agents.items() if not game.powers[p_name].is_eliminated()}
 
     for phase_block in saved_game.get("phases", []):
         phase_name = phase_block["name"]
@@ -159,9 +162,7 @@ async def save_game_state(
 
     # 4.  Top-level metadata ----------------------------------------------------
     saved_game["phase_summaries"] = getattr(game, "phase_summaries", {})
-    saved_game["final_agent_states"] = {
-        p_name: {"relationships": a.relationships, "goals": a.goals} for p_name, a in agents.items()
-    }
+    saved_game["final_agent_states"] = {p_name: {"relationships": a.relationships, "goals": a.goals} for p_name, a in agents.items()}
 
     await atomic_write_json_async(saved_game, output_path)
     logger.info("Game state saved successfully.")
@@ -172,6 +173,7 @@ def load_game_state(
     game_file_name: str,
     run_config,
     resume_from_phase: Optional[str] = None,
+    lexicon_client: Optional[Any] = None,
 ) -> Tuple["Game", Dict[str, "DiplomacyAgent"], "GameHistory", Optional[Any]]:
     """
     Load and fully re-hydrate the game, agents and GameHistory – including
@@ -213,19 +215,19 @@ def load_game_state(
     agents: Dict[str, "DiplomacyAgent"] = {}
     power_model_map: Dict[str, str] = {}
     powers_order = sorted(list(ALL_POWERS))
-    
+
     # Parse token limits from run_config
-    default_max_tokens = run_config.max_tokens if run_config and hasattr(run_config, 'max_tokens') else 16000
+    default_max_tokens = run_config.max_tokens if run_config and hasattr(run_config, "max_tokens") else 16000
     model_max_tokens = {p: default_max_tokens for p in powers_order}
-    
-    if run_config and hasattr(run_config, 'max_tokens_per_model') and run_config.max_tokens_per_model:
+
+    if run_config and hasattr(run_config, "max_tokens_per_model") and run_config.max_tokens_per_model:
         per_model_values = [s.strip() for s in run_config.max_tokens_per_model.split(",")]
         if len(per_model_values) == 7:
             for power, token_val_str in zip(powers_order, per_model_values):
                 model_max_tokens[power] = int(token_val_str)
         else:
             logger.warning("Expected 7 values for --max_tokens_per_model, using default.")
-    
+
     if run_config and getattr(run_config, "models", None):
         provided = [m.strip() for m in run_config.models.split(",")]
         if len(provided) == len(powers_order):
@@ -243,15 +245,14 @@ def load_game_state(
         for power_name, agent_data in last_phase_data["state_agents"].items():
             override_id = power_model_map.get(power_name)
             prompts_dir_from_config = (
-                run_config.prompts_dir_map.get(power_name)
-                if getattr(run_config, "prompts_dir_map", None)
-                else run_config.prompts_dir
+                run_config.prompts_dir_map.get(power_name) if getattr(run_config, "prompts_dir_map", None) else run_config.prompts_dir
             )
             agents[power_name] = deserialize_agent(
                 agent_data,
                 prompts_dir=prompts_dir_from_config,
                 override_model_id=override_id,
                 override_max_tokens=model_max_tokens.get(power_name),
+                lexicon_client=lexicon_client,
             )
 
     # --- Rebuild GameHistory --------------------------------------------------
@@ -306,6 +307,7 @@ async def initialize_new_game(
     game: Game,
     game_history: GameHistory,
     llm_log_file_path: str,
+    lexicon_client: Optional[Any] = None,
 ) -> Dict[str, DiplomacyAgent]:
     """Initializes agents for a new game (supports per-power prompt directories)."""
 
@@ -331,12 +333,8 @@ async def initialize_new_game(
         elif len(provided_models) == 1:
             game.power_model_map = dict(zip(powers_order, provided_models * 7))
         else:
-            logger.error(
-                f"Expected {len(powers_order)} models for --models but got {len(provided_models)}."
-            )
-            raise Exception(
-                "Invalid number of models. Models list must be either exactly 1 or 7 models, comma delimited."
-            )
+            logger.error(f"Expected {len(powers_order)} models for --models but got {len(provided_models)}.")
+            raise Exception("Invalid number of models. Models list must be either exactly 1 or 7 models, comma delimited.")
     else:
         game.power_model_map = assign_models_to_powers()
 
@@ -355,7 +353,7 @@ async def initialize_new_game(
                 logger.info(f"[{power_name}] Using prompts_dir from args: {prompts_dir_for_power}")
 
             try:
-                client = load_model_client(model_id, prompts_dir=prompts_dir_for_power)
+                client = load_model_client(model_id, prompts_dir=prompts_dir_for_power, lexicon_client=lexicon_client)
                 client.max_tokens = model_max_tokens[power_name]
                 agent = DiplomacyAgent(
                     power_name=power_name,
@@ -392,4 +390,3 @@ async def initialize_new_game(
                 logger.info(f"Successfully initialized agent state for {power_name}.")
 
     return agents
-
