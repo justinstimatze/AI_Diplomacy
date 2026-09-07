@@ -51,6 +51,7 @@ START_YEAR=1901
 NUM_NEGOTIATION_ROUNDS=2
 GEMOT_ENABLED=true
 LEXICON_ENABLED=false
+PLANNING_PHASE_ENABLED=false
 PER_SEASON=false
 INCREMENTAL=true
 SEED_BASE=2026
@@ -70,6 +71,7 @@ while [[ $# -gt 0 ]]; do
     --rounds) NUM_NEGOTIATION_ROUNDS="$2"; shift 2 ;;
     --no-gemot) GEMOT_ENABLED=false; shift ;;
     --lexicon) LEXICON_ENABLED=true; shift ;;
+    --planning-only) PLANNING_PHASE_ENABLED=true; shift ;;
     --per-season) PER_SEASON=true; shift ;;
     --gemot-url) GEMOT_URL="$2"; shift 2 ;;
     --results-dir) RESULTS_DIR="$2"; shift 2 ;;
@@ -100,6 +102,7 @@ echo "Per-season: $PER_SEASON"
 echo "Incremental: $INCREMENTAL"
 echo "Gemot: $GEMOT_ENABLED"
 echo "Lexicon: $LEXICON_ENABLED"
+echo "Planning phase (no lexicon): $PLANNING_PHASE_ENABLED"
 echo "Results: $RESULTS_DIR"
 echo "---"
 
@@ -281,6 +284,12 @@ for YEAR_INT in $(seq "$START_YEAR" "$MAX_YEAR"); do
     # or default run's behavior is unchanged from before this flag existed.
     if [[ "$LEXICON_ENABLED" == "true" ]]; then
       GAME_ARGS+=(--lexicon --planning_phase)
+    elif [[ "$PLANNING_PHASE_ENABLED" == "true" ]]; then
+      # Planning phase without lexicon -- lets a control arm hold the planning
+      # step constant while varying only tool access, avoiding the confound
+      # where --lexicon's implied --planning_phase silently changed two
+      # variables (lexicon access AND the planning reasoning step) at once.
+      GAME_ARGS+=(--planning_phase)
     fi
 
     # Determine how to pause
