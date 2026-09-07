@@ -55,7 +55,7 @@ def deserialize_agent(
     instead of the one stored in the save file.
     """
     model_id = override_model_id or agent_data["model_id"]
-    client = load_model_client(model_id, prompts_dir=prompts_dir, lexicon_client=lexicon_client)
+    client = load_model_client(model_id, prompts_dir=prompts_dir, lexicon_client=lexicon_client, power_name=agent_data["power_name"])
 
     # Use override if provided, otherwise use saved value, otherwise default to 16000
     client.max_tokens = override_max_tokens or agent_data.get("max_tokens", 16000)
@@ -353,7 +353,7 @@ async def initialize_new_game(
                 logger.info(f"[{power_name}] Using prompts_dir from args: {prompts_dir_for_power}")
 
             try:
-                client = load_model_client(model_id, prompts_dir=prompts_dir_for_power, lexicon_client=lexicon_client)
+                client = load_model_client(model_id, prompts_dir=prompts_dir_for_power, lexicon_client=lexicon_client, power_name=power_name)
                 client.max_tokens = model_max_tokens[power_name]
                 agent = DiplomacyAgent(
                     power_name=power_name,

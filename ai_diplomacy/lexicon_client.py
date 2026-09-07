@@ -307,7 +307,7 @@ class LexiconClient:
             raise RuntimeError(f"lexicon mcp error: {resp['error']}")
         return resp.get("result")
 
-    async def call_tool(self, name: str, args: dict, timeout: float = 30.0) -> Optional[dict]:
+    async def call_tool(self, name: str, args: dict, timeout: float = 30.0, power: Optional[str] = None) -> Optional[dict]:
         """Call one lexicon tool. Never raises -- returns None on any failure
         (timeout, crash, malformed response) so a lexicon hiccup can never
         stall or crash an hours-long, unattended game run. Every call
@@ -342,7 +342,7 @@ class LexiconClient:
             result, gate_dropped = await self._materiality_filter(call_args.get("text", ""), result)
 
         latency_ms = (time.monotonic() - start) * 1000
-        self._log_call(name, call_args, latency_ms, result, error, gate_dropped=gate_dropped)
+        self._log_call(name, call_args, latency_ms, result, error, gate_dropped=gate_dropped, power=power)
         return result
 
     async def _materiality_filter(self, scenario: str, result: dict) -> tuple[dict, list]:
@@ -394,11 +394,13 @@ class LexiconClient:
         result: Optional[dict],
         error: Optional[str],
         gate_dropped: Optional[list] = None,
+        power: Optional[str] = None,
     ) -> None:
         if not self.call_log_path:
             return
         entry: dict[str, Any] = {
             "ts": time.time(),
+            "power": power,
             "tool": name,
             "args": args,
             "latency_ms": round(latency_ms, 1),

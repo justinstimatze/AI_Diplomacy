@@ -889,7 +889,13 @@ class ClaudeClient(BaseModelClient):
     For 'claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022', etc.
     """
 
-    def __init__(self, model_name: str, prompts_dir: Optional[str] = None, lexicon_client: Optional[Any] = None):
+    def __init__(
+        self,
+        model_name: str,
+        prompts_dir: Optional[str] = None,
+        lexicon_client: Optional[Any] = None,
+        power_name: Optional[str] = None,
+    ):
         super().__init__(model_name, prompts_dir=prompts_dir)
         self.client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
         # Optional ai_diplomacy.lexicon_client.LexiconClient. When set AND the
@@ -898,6 +904,11 @@ class ClaudeClient(BaseModelClient):
         # instead of a single-shot completion. Untyped (Any) to avoid a
         # module-level import cycle with lexicon_client.py.
         self.lexicon_client = lexicon_client
+        # One ClaudeClient is constructed per power (see load_model_client
+        # call sites in game_logic.py), so this is stable for the instance's
+        # whole life -- attached here purely so lexicon tool calls can be
+        # attributed to a power in lexicon_calls.jsonl.
+        self.power_name = power_name
 
     async def _generate_response_with_tools(self, prompt: str, temperature: float, system_prompt_content: str) -> str:
         from .lexicon_client import LEXICON_TOOLS, DEFAULT_MAX_TOOL_ROUNDTRIPS
@@ -922,7 +933,7 @@ class ClaudeClient(BaseModelClient):
             for block in response.content:
                 if getattr(block, "type", None) != "tool_use":
                     continue
-                result = await self.lexicon_client.call_tool(block.name, block.input or {})
+                result = await self.lexicon_client.call_tool(block.name, block.input or {}, power=self.power_name)
                 tool_results.append(
                     {
                         "type": "tool_result",
@@ -944,6 +955,12 @@ class ClaudeClient(BaseModelClient):
 
         text_blocks = [b.text for b in response.content if getattr(b, "type", None) == "text" and getattr(b, "text", None)]
         if not text_blocks:
+            # TODO(lexicon): log response.stop_reason and [b.type for b in response.content]
+            # here before raising -- this fires occasionally (self-heals via the caller's
+            # retry) and we don't yet know if it's an empty-string text block getting
+            # filtered by the truthy check above, or a genuinely content-less final turn.
+            # Observed 2026-09-06 during Phase A treatment run, always attempt 1/5, across
+            # multiple powers, never exhausts retries.
             raise ValueError(f"[{self.model_name}] LLM returned no text content after tool loop.")
         return "\n".join(text_blocks).strip()
 
@@ -1504,7 +1521,12 @@ class Prefix(StrEnum):
     TOGETHER = "together"
 
 
-def load_model_client(model_id: str, prompts_dir: Optional[str] = None, lexicon_client: Optional[Any] = None) -> BaseModelClient:
+def load_model_client(
+    model_id: str,
+    prompts_dir: Optional[str] = None,
+    lexicon_client: Optional[Any] = None,
+    power_name: Optional[str] = None,
+) -> BaseModelClient:
     """
     Recognises strings like
         gpt-4o
@@ -1579,7 +1601,7 @@ def load_model_client(model_id: str, prompts_dir: Optional[str] = None, lexicon_
             case Prefix.OPENAI_RESPONSES:
                 return OpenAIResponsesClient(spec.model, prompts_dir, api_key=inline_key, reasoning_effort=reasoning_effort)
             case Prefix.ANTHROPIC:
-                return ClaudeClient(spec.model, prompts_dir, lexicon_client=lexicon_client)
+                return ClaudeClient(spec.model, prompts_dir, lexicon_client=lexicon_client, power_name=power_name)
             case Prefix.GEMINI:
                 return GeminiClient(spec.model, prompts_dir)
             case Prefix.DEEPSEEK:
@@ -1621,7 +1643,7 @@ def load_model_client(model_id: str, prompts_dir: Optional[str] = None, lexicon_
 
     if "claude" in lower_id:
         logger.info(f"[load_model_client] Selected ClaudeClient for '{spec.model}'")
-        return ClaudeClient(spec.model, prompts_dir, lexicon_client=lexicon_client)
+        return ClaudeClient(spec.model, prompts_dir, lexicon_client=lexicon_client, power_name=power_name)
 
     if "gemini" in lower_id:
         logger.info(f"[load_model_client] Selected GeminiClient for '{spec.model}'")
