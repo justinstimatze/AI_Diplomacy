@@ -224,21 +224,18 @@ BRIEFING_EOF
       echo "  $POWER_UPPER: no briefing available, using base prompt"
     fi
   done
-}
 
-# --- Get latest prompts dir (most recent analysis cycle's prompts) ---
-latest_prompts() {
-  # Find most recent prompts directory
-  local latest=""
-  for d in "$RESULTS_DIR"/*/prompts; do
-    if [[ -d "$d" ]]; then
-      latest="$d"
-    fi
-  done
-  echo "${latest:-$PROMPTS_TEMPLATE_DIR}"
+  LAST_PROMPTS_DIR="$CYCLE_PROMPTS"
 }
 
 # --- Main game loop ---
+# LAST_PROMPTS_DIR tracks the most recent analysis cycle's prompts dir by
+# construction order, not by globbing "$RESULTS_DIR"/*/prompts -- bash glob
+# expansion sorts lexicographically, so "year10/prompts" sorts before
+# "year2/prompts" and a glob-based "latest" pick goes stale (off by one, then
+# worse) as soon as a run reaches double-digit years or per-season labels
+# cross a year boundary.
+LAST_PROMPTS_DIR="$PROMPTS_TEMPLATE_DIR"
 STEP_NUM=0
 for YEAR_INT in $(seq "$START_YEAR" "$MAX_YEAR"); do
   YEAR_NUM=$((YEAR_INT - 1900))
@@ -302,8 +299,7 @@ for YEAR_INT in $(seq "$START_YEAR" "$MAX_YEAR"); do
     fi
 
     # Use latest available prompts
-    CURRENT_PROMPTS=$(latest_prompts)
-    GAME_ARGS+=(--prompts_dir "$CURRENT_PROMPTS")
+    GAME_ARGS+=(--prompts_dir "$LAST_PROMPTS_DIR")
 
     cd "$AI_DIPLOMACY_DIR"
     python lm_game.py "${GAME_ARGS[@]}" 2>&1 | tee "$RESULTS_DIR/${LABEL}_game.log"

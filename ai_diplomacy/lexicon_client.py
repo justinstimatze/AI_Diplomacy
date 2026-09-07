@@ -296,6 +296,14 @@ class LexiconClient:
         await self._write({"jsonrpc": "2.0", "method": method, "params": params})
 
     async def _request(self, method: str, params: dict, timeout: float = 25.0) -> Any:
+        # This is strictly request/response (no id-keyed multiplexing), so a
+        # timed-out read leaves its eventual response line sitting unread in
+        # the pipe -- the NEXT call's readline() would silently pick up that
+        # stale line and misattribute it as its own result. Validate the id
+        # so that failure mode raises instead of corrupting the next call;
+        # callers (call_tool) treat any exception here as reason to restart
+        # the subprocess, since a mismatched/timed-out id means the stream
+        # itself can no longer be trusted, not just this one request.
         req_id = self._next_id
         self._next_id += 1
         await self._write({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
@@ -303,6 +311,8 @@ class LexiconClient:
         if not line:
             raise RuntimeError("lexicon mcp subprocess closed stdout unexpectedly")
         resp = json.loads(line)
+        if resp.get("id") != req_id:
+            raise RuntimeError(f"lexicon mcp response id mismatch (stream desync): expected {req_id}, got {resp.get('id')!r}")
         if resp.get("error"):
             raise RuntimeError(f"lexicon mcp error: {resp['error']}")
         return resp.get("result")
@@ -326,7 +336,23 @@ class LexiconClient:
             if self._proc is None:
                 raise RuntimeError("lexicon client not started")
             async with self._lock:
-                raw = await self._request("tools/call", {"name": name, "arguments": call_args}, timeout=timeout)
+                try:
+                    raw = await self._request("tools/call", {"name": name, "arguments": call_args}, timeout=timeout)
+                except Exception:
+                    # A timeout or id-mismatch here means the stdio stream can no
+                    # longer be trusted (see _request) -- the process may still be
+                    # alive and about to write a stale response into the next
+                    # call's read. Restart it now, still holding the lock, so no
+                    # concurrent caller can interleave with the half-dead pipe.
+                    logger.warning("[lexicon_client] request failed, restarting subprocess to avoid stream desync", exc_info=True)
+                    old_proc, self._proc = self._proc, None
+                    if old_proc is not None:
+                        old_proc.kill()
+                    try:
+                        await self.start()
+                    except Exception:
+                        logger.error("[lexicon_client] failed to restart subprocess after desync", exc_info=True)
+                    raise
             content = (raw or {}).get("content") or []
             text = content[0].get("text") if content and isinstance(content[0], dict) else None
             result = json.loads(text) if text else None
@@ -358,7 +384,7 @@ class LexiconClient:
             return result, []
 
         candidates = "\n".join(
-            f"- id={a['id']}: {a['name']} -- {a.get('agent_instruction') or a.get('mechanism') or a.get('gloss') or ''}" for a in items
+            f"- id={a.get('id')}: {a.get('name')} -- {a.get('agent_instruction') or a.get('mechanism') or a.get('gloss') or ''}" for a in items
         )
         prompt = LEXICON_MATERIALITY_PROMPT.format(scenario=scenario[:2000], candidates=candidates)
         try:

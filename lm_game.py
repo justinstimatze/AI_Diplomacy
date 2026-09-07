@@ -197,7 +197,14 @@ def parse_arguments():
         ),
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.lexicon and not args.planning_phase:
+        # --lexicon implies --planning_phase: there's nothing to attach tool
+        # access to otherwise. run_gemot_experiment.sh already sets both
+        # together, but lm_game.py can be invoked directly, so enforce it
+        # here too rather than silently no-op'ing lexicon's planning access.
+        args.planning_phase = True
+    return args
 
 
 async def main():
